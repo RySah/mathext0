@@ -6,6 +6,7 @@ import "core:sort"
 Reference_Index :: struct {
     reference: []u8,
     suffixes:  []int,
+    allocator: mem.Allocator,
 }
 
 Suffix_Sort :: struct {
@@ -14,7 +15,7 @@ Suffix_Sort :: struct {
 }
 
 index_create :: proc(reference: []u8, allocator: mem.Allocator = context.allocator) -> Reference_Index {
-    idx := Reference_Index{reference = reference}
+    idx := Reference_Index{reference = reference, allocator = allocator}
     if len(reference) == 0 { return idx }
     idx.suffixes = make([]int, len(reference), allocator)
     for i in 0..<len(reference) { idx.suffixes[i] = i }
@@ -49,7 +50,9 @@ index_create :: proc(reference: []u8, allocator: mem.Allocator = context.allocat
 
 index_destroy :: proc(index: ^Reference_Index) {
     if index == nil { return }
-    delete(index.suffixes)
+    allocator := index.allocator
+    if allocator.procedure == nil { allocator = context.allocator }
+    delete(index.suffixes, allocator)
     index^ = {}
 }
 

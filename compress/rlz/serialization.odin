@@ -180,7 +180,7 @@ serialize :: proc(m: ^Module, allocator: mem.Allocator = context.allocator) -> (
     output := make([]u8, size, allocator)
     written, err2 := serialize_into(m, output)
     if err2 != .None {
-        delete(output)
+        delete(output, allocator)
         return nil, err2
     }
     return output[:written], .None

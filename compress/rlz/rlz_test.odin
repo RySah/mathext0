@@ -1,5 +1,6 @@
 package rlz
 
+import "core:mem"
 import "core:testing"
 
 expect_bytes_equal :: proc(t: ^testing.T, got, want: []u8, message := "bytes differ") {
@@ -278,6 +279,48 @@ test_reference_build_options_and_convenience_encoder :: proc(t: ^testing.T) {
     module_destroy(&module)
     encoder_destroy(&encoder)
     delete(reference)
+}
+
+@(test)
+test_reference_builder_custom_allocator_ownership :: proc(t: ^testing.T) {
+    track: mem.Tracking_Allocator
+    mem.tracking_allocator_init(&track, context.allocator)
+    defer mem.tracking_allocator_destroy(&track)
+    allocator := mem.tracking_allocator(&track)
+    inputs := [][]u8{
+        {'r','e','p','e','a','t','e','d','-','d','a','t','a'},
+        {'d','a','t','a','-','r','e','p','e','a','t','e','d'},
+        {'o','t','h','e','r','-','d','a','t','a'},
+    }
+
+    for strategy in Reference_Strategy.Automatic..=Reference_Strategy.Coverage_Optimized {
+        reference, build_err := reference_build(inputs, Reference_Options{
+            max_size = 17,
+            strategy = strategy,
+        }, allocator)
+        testing.expect_value(t, build_err, Error.None)
+        encoder := encoder_create(reference, default_options(.GDC_Relative), allocator)
+        for input in inputs {
+            module, encode_err := encode_indexed(&encoder, input, allocator)
+            testing.expect_value(t, encode_err, Error.None)
+            archive, serialize_err := serialize(&module, allocator)
+            testing.expect_value(t, serialize_err, Error.None)
+            restored, restore_err := deserialize(archive, reference, {}, allocator)
+            testing.expect_value(t, restore_err, Error.None)
+            output := make([]u8, len(input), allocator)
+            decoder := cpu_decoder()
+            testing.expect_value(t, decode(&decoder, reference, &restored, output), Error.None)
+            expect_bytes_equal(t, output, input)
+            delete(output, allocator)
+            module_destroy(&restored)
+            delete(archive, allocator)
+            module_destroy(&module)
+        }
+        encoder_destroy(&encoder)
+        delete(reference, allocator)
+    }
+    testing.expect(t, track.current_memory_allocated == 0,
+        "all custom-allocator reference-builder storage must be released")
 }
 
 @(test)

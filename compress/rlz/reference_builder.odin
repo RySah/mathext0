@@ -41,6 +41,12 @@ Reference_Candidate_Sort :: struct {
 	coverage:   bool,
 }
 
+Coverage_Set :: struct {
+	keys:     []Reference_Hash,
+	occupied: []bool,
+	allocator: mem.Allocator,
+}
+
 contains_chunk :: proc(reference, chunk: []u8) -> bool {
 	if len(chunk) == 0 || len(chunk) > len(reference) { return false }
 	for at in 0..=(len(reference)-len(chunk)) {
@@ -206,18 +212,61 @@ append_candidate_reference :: proc(
 	return false
 }
 
+coverage_set_create :: proc(capacity: int, allocator: mem.Allocator) -> Coverage_Set {
+	size := 1
+	for size < max(2, capacity*2) {
+		size *= 2
+	}
+	return Coverage_Set{
+		keys = make([]Reference_Hash, size, allocator),
+		occupied = make([]bool, size, allocator),
+		allocator = allocator,
+	}
+}
+
+coverage_set_destroy :: proc(set: ^Coverage_Set) {
+	if set == nil { return }
+	delete(set.keys, set.allocator)
+	delete(set.occupied, set.allocator)
+	set^ = {}
+}
+
+coverage_set_slot :: proc(set: ^Coverage_Set, key: Reference_Hash) -> int {
+	if set == nil || len(set.keys) == 0 || (len(set.keys)&(len(set.keys)-1)) != 0 {
+		return -1
+	}
+	slot := int(key.first & u64(len(set.keys)-1))
+	start := slot
+	for {
+		if !set.occupied[slot] || set.keys[slot] == key { return slot }
+		slot = (slot+1) & (len(set.keys)-1)
+		if slot == start { return -1 }
+	}
+}
+
+coverage_set_contains :: proc(set: ^Coverage_Set, key: Reference_Hash) -> bool {
+	slot := coverage_set_slot(set, key)
+	return slot >= 0 && set.occupied[slot]
+}
+
+coverage_set_insert :: proc(set: ^Coverage_Set, key: Reference_Hash) {
+	slot := coverage_set_slot(set, key)
+	if slot < 0 { return }
+	set.keys[slot] = key
+	set.occupied[slot] = true
+}
+
 candidate_has_new_coverage :: proc(
 	inputs: [][]u8,
 	candidate: Reference_Candidate,
-	covered: map[Reference_Hash]bool,
+	covered: ^Coverage_Set,
 ) -> bool {
 	input := inputs[candidate.input_index]
 	segment := input[candidate.at:candidate.at+candidate.length]
 	gram_size := min(4, len(segment))
 	for at in 0..=len(segment)-gram_size {
 		key := reference_window_hash(segment[at:at+gram_size])
-		present := covered[key]
-		if !present { return true }
+		if !coverage_set_contains(covered, key) { return true }
 	}
 	return false
 }
@@ -225,13 +274,13 @@ candidate_has_new_coverage :: proc(
 mark_candidate_coverage :: proc(
 	inputs: [][]u8,
 	candidate: Reference_Candidate,
-	covered: ^map[Reference_Hash]bool,
+	covered: ^Coverage_Set,
 ) {
 	input := inputs[candidate.input_index]
 	segment := input[candidate.at:candidate.at+candidate.length]
 	gram_size := min(4, len(segment))
 	for at in 0..=len(segment)-gram_size {
-		covered[reference_window_hash(segment[at:at+gram_size])] = true
+		coverage_set_insert(covered, reference_window_hash(segment[at:at+gram_size]))
 	}
 }
 
@@ -292,13 +341,14 @@ build_scored_reference :: proc(
 	sort_reference_candidates(inputs, candidates, coverage)
 
 	segment_limit := window_size
-	covered: map[Reference_Hash]bool
+	covered: Coverage_Set
 	if coverage {
-		covered = make(map[Reference_Hash]bool, min(len(candidates), 4096), allocator)
-		defer delete(covered)
+		covered_capacity := len(candidates)*max(1, window_size-3)
+		covered = coverage_set_create(covered_capacity, allocator)
+		defer coverage_set_destroy(&covered)
 	}
 	for candidate in candidates {
-		if coverage && !candidate_has_new_coverage(inputs, candidate, covered) {
+		if coverage && !candidate_has_new_coverage(inputs, candidate, &covered) {
 			continue
 		}
 		if append_candidate_reference(&result, inputs, candidate, maximum_size, segment_limit) &&
@@ -392,7 +442,7 @@ reference_build :: proc(
 		defer {
 			for built, i in refs {
 				_ = i
-				delete(built)
+				delete(built, allocator)
 			}
 		}
 
