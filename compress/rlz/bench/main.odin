@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:time"
 import rlz "../"
 
@@ -21,6 +22,156 @@ Benchmark_Item :: struct {
     encode_ms: f64,
     payload: int,
     ratio: f64,
+}
+
+Reference_Dataset :: struct {
+    name:   string,
+    storage: [dynamic][]u8,
+}
+
+reference_dataset :: proc(name: string, input_count, input_size, similarity: int) -> Reference_Dataset {
+    dataset := Reference_Dataset{
+        name = name,
+        storage = make([dynamic][]u8, 0, input_count),
+    }
+    base := make([]u8, input_size)
+    defer delete(base)
+    state: u32 = 0x9e3779b9
+    for i in 0..<input_size {
+        state = state*1664525+1013904223
+        base[i] = u8(state >> 24)
+    }
+    for input_index in 0..<input_count {
+        input := make([]u8, input_size)
+        for i in 0..<input_size {
+            state = state*1664525+1013904223
+            if int((state >> 24)) < similarity {
+                input[i] = base[(i+input_index*37) % input_size]
+            } else {
+                input[i] = u8(state >> 16)
+            }
+        }
+        append(&dataset.storage, input)
+    }
+    return dataset
+}
+
+reference_dataset_destroy :: proc(dataset: ^Reference_Dataset) {
+    if dataset == nil { return }
+    for input in dataset.storage { delete(input) }
+    delete(dataset.storage)
+    dataset^ = {}
+}
+
+concatenated_reference :: proc(inputs: [][]u8, maximum_size: int, allocator: mem.Allocator) -> []u8 {
+    reference := make([dynamic]u8, 0, maximum_size, allocator)
+    for input in inputs {
+        remaining := maximum_size-len(reference)
+        if remaining <= 0 { break }
+        append(&reference, ..input[:min(len(input), remaining)])
+    }
+    return reference[:]
+}
+
+benchmark_reference_strategy :: proc(
+    name, dataset_name: string,
+    inputs: [][]u8,
+    maximum_size: int,
+    strategy: rlz.Reference_Strategy,
+) {
+    track: mem.Tracking_Allocator
+    mem.tracking_allocator_init(&track, context.allocator)
+    tracked := mem.tracking_allocator(&track)
+
+    start := time.tick_now()
+    reference: []u8
+    err: rlz.Error
+    if strategy == .Automatic && name == "concatenation" {
+        reference = concatenated_reference(inputs, maximum_size, tracked)
+    } else {
+        reference, err = rlz.reference_build(inputs, rlz.Reference_Options{
+            max_size = maximum_size,
+            strategy = strategy,
+        }, tracked)
+    }
+    build_ms := time.duration_milliseconds(time.tick_since(start))
+    peak := track.peak_memory_allocated
+    if err != .None {
+        fmt.printf("%-13s %-19s construction failed: %v\n", dataset_name, name, err)
+        mem.tracking_allocator_destroy(&track)
+        return
+    }
+
+    encoder := rlz.encoder_create(reference, rlz.default_options(.GDC_Relative))
+    payload_size := 0
+    phrase_count := 0
+    matched_bytes: i64
+    reference_phrases: i64
+    input_bytes := 0
+    for input in inputs {
+        input_bytes += len(input)
+        module, encode_err := rlz.encode_indexed(&encoder, input)
+        if encode_err != .None {
+            fmt.printf("%-13s %-19s encoding failed: %v\n", dataset_name, name, encode_err)
+            rlz.module_destroy(&module)
+            rlz.encoder_destroy(&encoder)
+            delete(reference, tracked)
+            mem.tracking_allocator_destroy(&track)
+            return
+        }
+        serialized, size_err := rlz.serialize(&module)
+        if size_err != .None {
+            fmt.printf("%-13s %-19s sizing failed: %v\n", dataset_name, name, size_err)
+        } else {
+            payload_size += len(serialized)
+        }
+        delete(serialized)
+        phrase_count += len(module.phrases)
+        for phrase in module.phrases {
+            if phrase.kind != .Literal {
+                reference_phrases += 1
+                matched_bytes += i64(phrase.length)
+            }
+        }
+        rlz.module_destroy(&module)
+    }
+    combined := len(reference)+payload_size
+    ratio := f64(combined)/f64(max(1, input_bytes))
+    average_match := 0.0
+    if reference_phrases > 0 { average_match = f64(matched_bytes)/f64(reference_phrases) }
+    fmt.printf(
+        "%-13s %-19s build=%9.3f ms reference=%7d payload=%9d combined=%9d ratio=%.4f phrases=%7d avg_match=%.2f peak=%d B\n",
+        dataset_name, name, build_ms, len(reference), payload_size, combined,
+        ratio, phrase_count, average_match, peak)
+
+    rlz.encoder_destroy(&encoder)
+    delete(reference, tracked)
+    mem.tracking_allocator_destroy(&track)
+}
+
+benchmark_reference_builders :: proc() {
+    datasets := make([dynamic]Reference_Dataset, 0, 6)
+    defer {
+        for i in 0..<len(datasets) { reference_dataset_destroy(&datasets[i]) }
+        delete(datasets)
+    }
+    append(&datasets, reference_dataset("small/high", 6, 4*1024, 240))
+    append(&datasets, reference_dataset("small/low", 6, 4*1024, 8))
+    append(&datasets, reference_dataset("medium/high", 6, 16*1024, 208))
+    append(&datasets, reference_dataset("medium/low", 6, 16*1024, 24))
+    append(&datasets, reference_dataset("large/high", 4, 64*1024, 192))
+    append(&datasets, reference_dataset("large/low", 4, 64*1024, 16))
+
+    fmt.println("Reference construction (GDC_Relative payload metrics)")
+    for dataset in datasets {
+        maximum_size := min(16*1024, len(dataset.storage[0])/2)
+        benchmark_reference_strategy("concatenation", dataset.name, dataset.storage[:], maximum_size, .Automatic)
+        benchmark_reference_strategy("sampling", dataset.name, dataset.storage[:], maximum_size, .Representative_Sampling)
+        benchmark_reference_strategy("frequent", dataset.name, dataset.storage[:], maximum_size, .Frequent_Substrings)
+        benchmark_reference_strategy("coverage", dataset.name, dataset.storage[:], maximum_size, .Coverage_Optimized)
+        benchmark_reference_strategy("automatic", dataset.name, dataset.storage[:], maximum_size, .Automatic)
+    }
+    fmt.println()
 }
 
 input_of :: proc() -> ([dynamic]u8, [dynamic]u8) {
@@ -189,6 +340,8 @@ benchmark_warm :: proc(ctx: ^rlz.OpenGL_Context, reference: []u8,
 }
 
 main :: proc() {
+    benchmark_reference_builders()
+
     reference_dynamic, input_dynamic := input_of()
     defer delete(reference_dynamic)
     defer delete(input_dynamic)

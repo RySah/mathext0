@@ -187,6 +187,100 @@ test_deterministic_reference_builder :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_generated_references_round_trip_every_format :: proc(t: ^testing.T) {
+    inputs := [][]u8{
+        {'a','b','c','d','e','f','g','h','a','b','c','d'},
+        {'x','y','z','a','b','c','d','Q','R','S'},
+        {'x','y','z','a','b','c','d','Q','R','S'},
+        {},
+        {0,1,2,3,0,1,2,3,255},
+    }
+    for strategy in Reference_Strategy.Automatic..=Reference_Strategy.Coverage_Optimized {
+        reference, err := reference_build(inputs, Reference_Options{
+            max_size = 19,
+            strategy = strategy,
+        })
+        testing.expect_value(t, err, Error.None)
+        testing.expect(t, len(reference) <= 19, "generated reference exceeds limit")
+        for format in Format.RLZ..=Format.RLZAP {
+            encoder := encoder_create(reference, default_options(format))
+            for input in inputs {
+                module, encode_err := encode_indexed(&encoder, input)
+                testing.expect_value(t, encode_err, Error.None)
+                output := make([]u8, len(input))
+                decoder := cpu_decoder()
+                testing.expect_value(t, decode(&decoder, reference, &module, output), Error.None)
+                expect_bytes_equal(t, output, input)
+                delete(output)
+                module_destroy(&module)
+            }
+            encoder_destroy(&encoder)
+        }
+        delete(reference)
+    }
+}
+
+@(test)
+test_reference_build_options_and_convenience_encoder :: proc(t: ^testing.T) {
+    inputs := [][]u8{
+        {'A','A','A','A','B','B','B','B'},
+        {'A','A','A','A','C','C','C','C'},
+    }
+    for strategy in Reference_Strategy.Representative_Sampling..=Reference_Strategy.Coverage_Optimized {
+        first, first_err := reference_build(inputs, Reference_Options{max_size = 7, strategy = strategy})
+        defer delete(first)
+        second, second_err := reference_build(inputs, Reference_Options{max_size = 7, strategy = strategy})
+        defer delete(second)
+        testing.expect_value(t, first_err, Error.None)
+        testing.expect_value(t, second_err, Error.None)
+        testing.expect(t, len(first) <= 7)
+        expect_bytes_equal(t, first, second, "reference strategy must be deterministic")
+    }
+
+    empty, empty_err := reference_build(nil, Reference_Options{max_size = 8})
+    testing.expect_value(t, empty_err, Error.None)
+    testing.expect(t, len(empty) == 0)
+    delete(empty)
+    _, invalid_err := reference_build(inputs, Reference_Options{max_size = -1})
+    testing.expect_value(t, invalid_err, Error.Invalid_Argument)
+
+    automatic, automatic_err := reference_build(inputs, Reference_Options{
+        max_size = 8,
+        strategy = .Automatic,
+    })
+    defer delete(automatic)
+    testing.expect_value(t, automatic_err, Error.None)
+    automatic_score, score_err := reference_score(inputs, automatic, context.allocator)
+    testing.expect_value(t, score_err, Error.None)
+    representative := build_representative_reference(inputs, 8, 256, context.allocator)
+    defer delete(representative)
+    concatenated := build_concatenated_reference(inputs, 8, context.allocator)
+    defer delete(concatenated)
+    representative_score, _ := reference_score(inputs, representative, context.allocator)
+    concatenated_score, _ := reference_score(inputs, concatenated, context.allocator)
+    testing.expect(t, automatic_score <= representative_score,
+        "automatic strategy must not regress from representative sampling")
+    testing.expect(t, automatic_score <= concatenated_score,
+        "automatic strategy must not regress from concatenation")
+
+    reference, encoder, err := encoder_create_from_inputs(
+        inputs,
+        Reference_Options{max_size = 8, strategy = .Frequent_Substrings},
+        default_options(.GDC_Relative),
+    )
+    testing.expect_value(t, err, Error.None)
+    module, encode_err := encode_indexed(&encoder, inputs[0])
+    testing.expect_value(t, encode_err, Error.None)
+    output := make([]u8, len(inputs[0]))
+    testing.expect_value(t, decode_cpu(reference, &module, output), Error.None)
+    expect_bytes_equal(t, output, inputs[0])
+    delete(output)
+    module_destroy(&module)
+    encoder_destroy(&encoder)
+    delete(reference)
+}
+
+@(test)
 test_scalar_and_simd_decoders_match :: proc(t: ^testing.T) {
     reference := []u8{'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p'}
     input := []u8{

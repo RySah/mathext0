@@ -10,6 +10,80 @@ A general-purpose binary codec with four CPU formats:
 The package accepts arbitrary `[]u8` data. It does not depend on an application,
 engine, asset type, texture, mesh, or archive format.
 
+## Quick Start: automatic shared reference
+
+Build one reference from any collection of binary inputs:
+
+```odin
+// Build one reference from multiple inputs.
+reference, err := rlz.reference_build(
+    inputs,
+    rlz.Reference_Options{
+        max_size = 256 * 1024,
+        strategy = .Automatic,
+    },
+)
+if err != .None {
+    return
+}
+defer delete(reference)
+
+// Build the search index once.
+encoder := rlz.encoder_create(
+    reference,
+    rlz.default_options(.GDC_Relative),
+)
+defer rlz.encoder_destroy(&encoder)
+
+// Encode multiple inputs against the same reference.
+for input in inputs {
+    encoded, err := rlz.encode_indexed(&encoder, input)
+    if err != .None {
+        // Handle error.
+        continue
+    }
+
+    // Process or serialise the encoded module.
+    rlz.module_destroy(&encoded)
+}
+```
+
+`reference_build` returns owned storage allocated with the requested allocator.
+It borrows all input buffers only for the duration of the call. The shared
+reference must be preserved alongside the compressed modules and supplied again
+for future decoding; compressed modules store a fingerprint, not the reference
+bytes themselves.
+
+Available deterministic strategies are:
+
+- `.Representative_Sampling`, which distributes selected regions across
+  inputs.
+- `.Frequent_Substrings`, which prioritizes deduplicated repeated byte
+  sequences.
+- `.Coverage_Optimized`, which favors useful sequences seen across more inputs.
+- `.Automatic`, which evaluates those candidates plus concatenation and an empty
+  reference by exact serialized output size for all four formats, selecting the
+  lowest total reference-plus-payload result.
+
+All strategies respect `max_size`. A zero value uses the 1 MiB default; negative
+and oversized limits return an error. Construction does not use a temporary
+allocator for returned or persistent storage.
+
+For a combined convenience operation, `encoder_create_from_inputs` returns both
+the owned reference and an encoder. Destroy the encoder before deleting the
+reference:
+
+```odin
+reference, encoder, err := rlz.encoder_create_from_inputs(
+    inputs,
+    rlz.Reference_Options{max_size = 256*1024, strategy = .Automatic},
+    rlz.default_options(.RLZAP),
+)
+if err != .None { return }
+defer delete(reference)
+defer rlz.encoder_destroy(&encoder)
+```
+
 ## CPU use
 
 ```odin
@@ -157,8 +231,15 @@ isolated changes, long/repeated/random data, reusable encoders, serialization
 round trips, subranges, reference mismatch, malformed/truncated streams and
 decompression limits.
 
-The benchmark covers CPU decoding and standalone OpenGL compute for every
-format and reports median, p95 and average latency:
+The benchmark covers reference construction and CPU decoding, plus standalone
+OpenGL compute for every format. Construction runs on small, medium and large
+datasets at low and high similarity, and compares concatenation, representative
+sampling, frequent substrings, coverage optimization and automatic selection.
+It reports construction time, reference size, serialized payload size, combined
+reference-plus-payload size, compression ratio, phrase count, average match
+length and tracked peak construction memory.
+
+Decode reporting includes median, p95 and average latency:
 
 - **Cold GPU** creates a new OpenGL context, compiles the shader, allocates
   buffers, uploads all data, dispatches, synchronizes and reads back.
@@ -229,6 +310,9 @@ its low-level command recorder.
 
 - `encode` and `encode_indexed` allocate and return a Module; call
   `module_destroy`.
+- `reference_build` returns an owned reference; delete it after all encoders
+  and decoders using it are finished. `encoder_create_from_inputs` has the same
+  ownership requirement for its returned reference.
 - `serialize` returns owned bytes; delete them after use.
 - references are borrowed and must remain immutable and alive.
 - CPU whole-buffer and range decoding allocate nothing in their hot path.
